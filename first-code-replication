@@ -1,0 +1,145 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
+# Hyperparameters
+N_UNITS      = 100
+INPUT_SIZE   = 3
+HIDDEN_SIZE  = N_UNITS
+OUTPUT_SIZE  = 2
+TAU          = 1
+SIGMA        = 0.5     # Increased noise std for better angular variation
+MOMENTUM     = 0.4
+P_ZERO       = 0.05    # Decreased zero-inflation probability
+SEQ_LEN      = 200
+BATCH_SIZE   = 32
+NUM_BATCHES  = 500
+NUM_EPOCHS   = 10
+LR           = 0.001
+REG_LAMBDA   = 1e-4
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Generate synthetic dataset
+def generate_sequence(seq_len=SEQ_LEN):
+    theta0 = torch.rand(1) * 2 * math.pi  # [0, 2π]
+    av = torch.zeros(seq_len)
+    theta = torch.zeros(seq_len)
+    theta[0] = theta0
+
+    for t in range(1, seq_len):
+        x = 0.0 if torch.rand(1) < P_ZERO else torch.randn(1).item() * SIGMA
+        av[t] = x + MOMENTUM * av[t - 1]
+        theta[t] = theta[t - 1] + av[t] * TAU
+
+    sin0 = torch.sin(theta0).expand(seq_len, 1)
+    cos0 = torch.cos(theta0).expand(seq_len, 1)
+    inputs = torch.cat([sin0, cos0, av.unsqueeze(1)], dim=1)
+
+    targets = torch.stack([
+        torch.sin(theta),
+        torch.cos(theta)
+    ], dim=1)
+
+    return inputs, targets
+
+class AngularVelocityDataset(Dataset):
+    def __init__(self, num_sequences):
+        self.data = [generate_sequence() for _ in range(num_sequences)]
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+#define a continuous rnn model for the purposes of the replication
+class ContinuousRNN(nn.Module):
+    def __init__(self, input_size=INPUT_SIZE, hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE):
+        super().__init__()
+        self.Win  = nn.Parameter(torch.randn(hidden_size, input_size) * 0.1)
+        self.Wrec = nn.Parameter(torch.randn(hidden_size, hidden_size) * 0.1)
+        self.register_buffer('mask', (1 - torch.eye(hidden_size)))
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        self.Wout = nn.Linear(hidden_size, output_size, bias=False)
+
+    def forward(self, u):
+        batch_size, seq_len, _ = u.size()
+        x = torch.zeros(batch_size, HIDDEN_SIZE, device=u.device)
+        outputs, rates = [], []
+        for t in range(seq_len):
+            r = torch.relu(torch.tanh(x))
+            rec_in = r @ (self.Wrec * self.mask).T
+            in_in  = u[:, t, :] @ self.Win.T
+            noise = torch.randn_like(x) * (SIGMA * 0.1)
+            dx = (-x + rec_in + in_in + self.bias) / TAU + noise
+            x = x + TAU / 10  * dx
+            outputs.append(self.Wout(r))
+            rates.append(r)
+        y = torch.stack(outputs, dim=1)
+        rates = torch.stack(rates, dim=1)
+        return y, rates
+
+dataset = AngularVelocityDataset(num_sequences=BATCH_SIZE * NUM_BATCHES)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+model = ContinuousRNN().to(device)
+optimizer = optim.Adam(model.parameters(), lr=LR)
+mse_loss = nn.MSELoss()
+
+# Training loop
+mse_history = []
+model.train()
+for epoch in range(NUM_EPOCHS):
+    epoch_losses = []
+    for u, target in dataloader:
+        u = u.float().to(device)
+        target = target.float().to(device)
+        optimizer.zero_grad()
+        pred, rates = model(u)
+        loss_mse = mse_loss(pred, target)
+        loss_reg = REG_LAMBDA * rates.pow(2).mean()
+        (loss_mse + loss_reg).backward()
+        optimizer.step()
+        epoch_losses.append(loss_mse.item())
+    avg_loss = sum(epoch_losses) / len(epoch_losses)
+    mse_history.extend(epoch_losses)
+    print(f"Epoch {epoch+1}/{NUM_EPOCHS} — Avg MSE: {avg_loss:.6f}")
+
+
+#
+#VISULAZATIONS
+#
+
+
+# Loss Curve to help debug ml model issues
+plt.figure(figsize=(6,4))
+plt.plot(mse_history, linewidth=1)
+plt.xlabel('Batch')
+plt.ylabel('MSE Loss')
+plt.title('Training MSE over Batches')
+plt.tight_layout()
+plt.show()
+
+# True vs. Predicted Angle
+u_eval, target_eval = generate_sequence(SEQ_LEN)
+u_eval = u_eval.unsqueeze(0).to(device)
+target_eval = target_eval.numpy()
+
+with torch.no_grad():
+    pred_eval, _ = model(u_eval.float())
+pred_eval = pred_eval[0].cpu().numpy()
+
+true_angle = np.arctan2(target_eval[:,0], target_eval[:,1])
+pred_angle = np.arctan2(pred_eval[:,0], pred_eval[:,1])
+
+plt.figure(figsize=(6,4))
+plt.plot(true_angle, label='True', linewidth=2)
+plt.plot(pred_angle, label='Predicted', linestyle='--')
+plt.xlabel('Timestep')
+plt.ylabel('Angle (rad)')
+plt.title('Visualization 4: True vs. Predicted Head Direction')
+plt.legend()
+plt.tight_layout()
+plt.show()
